@@ -119,10 +119,13 @@ final class Shell implements Closeable {
             this.status = status;
         }
 
+        /**
+         * True only when the shell positively reported success. An unknown status (-1, the stream ended
+         * before the marker) is not success: the caller always verifies the resulting state anyway, and
+         * treating unknown as success is what let an interrupted `pm enable` look like it had worked.
+         */
         boolean ok() {
-            // -1 means the stream ended before the marker: treat unknown as success and let the caller's
-            // own state check decide, except where a status was actually reported.
-            return status == 0 || status == -1;
+            return status == 0;
         }
 
         /** The error text the shell printed, trimmed to one line, or "" for a successful command. */
@@ -131,7 +134,8 @@ final class Shell implements Closeable {
             String text = output.trim();
             int newline = text.indexOf('\n');
             if (newline > 0) text = text.substring(0, newline);
-            return text.isEmpty() ? "exit " + status : text;
+            if (text.isEmpty()) return status < 0 ? "no exit status came back" : "exit " + status;
+            return text;
         }
     }
 

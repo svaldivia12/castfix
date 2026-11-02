@@ -23,6 +23,8 @@ public class CastFixService extends Service {
      * post a second notification while doing no work.
      */
     private static final AtomicBoolean RUNNING = new AtomicBoolean();
+    /** Wait before the single boot-run retry, so it is not racing the same failing conditions. */
+    private static final long RETRY_AFTER_MS = 60_000;
 
     static boolean isRunning() {
         return RUNNING.get();
@@ -50,17 +52,47 @@ public class CastFixService extends Service {
             String result;
             try {
                 result = new CastFixer(this).run(trigger == null ? "unknown" : trigger);
+                // A boot run can lose to the network. If the credentials are still not there, one retry a
+                // minute later is far cheaper than leaving the TV broken until someone opens the app.
+                if (trigger != null && trigger.equals("restart") && needsRetry(result)) {
+                    result = retryOnce();
+                }
+            } catch (Throwable t) {
+                // run() reports its own failures, so anything reaching here is a bug. Still end the run
+                // properly: leaving the foreground notification up forever is worse than a vague message.
+                result = "The fix stopped unexpectedly: " + t;
             } finally {
                 RUNNING.set(false);
             }
-            new Handler(Looper.getMainLooper()).post(() -> {
-                Toast.makeText(this, "Cast Fix: " + result, Toast.LENGTH_LONG).show();
-                sendBroadcast(new Intent(ACTION_DONE).setPackage(getPackageName()));
-                stopForeground(STOP_FOREGROUND_REMOVE);
-                stopSelf();
-            });
+            String shown = result;
+            new Handler(Looper.getMainLooper()).post(() -> finish(shown));
         }, "castfix").start();
         return START_NOT_STICKY;
+    }
+
+    /** True when the first attempt failed in a way a later attempt could plausibly fix. */
+    private static boolean needsRetry(String result) {
+        return result != null && (result.contains("no Wi-Fi") || result.contains("Wireless debugging")
+                || result.contains("did not load"));
+    }
+
+    /** One more attempt after a pause, for the case where the boot run raced the network. */
+    private String retryOnce() {
+        try {
+            Thread.sleep(RETRY_AFTER_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "Interrupted before retrying.";
+        }
+        return new CastFixer(this).run("restart-retry");
+    }
+
+    /** Takes the notification down and tells the screen, whatever the run did. */
+    private void finish(String result) {
+        Toast.makeText(this, "Cast Fix: " + result, Toast.LENGTH_LONG).show();
+        sendBroadcast(new Intent(ACTION_DONE).setPackage(getPackageName()));
+        stopForeground(STOP_FOREGROUND_REMOVE);
+        stopSelf();
     }
 
     @Override

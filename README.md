@@ -43,12 +43,12 @@ boot Cast Fix:
 1. switches Wireless debugging on and connects to the TV's own adbd over loopback, with a key that was
    paired once
 2. puts back anything an interrupted earlier run left behind (see below)
-3. checks whether the receiver is failing, by watching what it logs for up to two of its one-minute
-   retries, rather than trusting whatever is still in the log buffer
-4. switches the stock launcher on (so a Home press in the meantime lands somewhere safe), then the setup
-   wizard
-5. waits for the receiver's next retry to log `Created singleton instance of ClientAuthSigner`, which
-   took 7 to 14 seconds in testing, and switches the wizard off as soon as it appears
+3. asks the receiver whether it can already sign, with the same handshake a phone makes. If it can, there
+   is nothing to do: a run that finds everything working finishes in about five seconds
+4. otherwise switches the stock launcher on (so a Home press in the meantime lands somewhere safe), then
+   the setup wizard
+5. retries that handshake every few seconds until the receiver signs, which took 33 seconds after a cold
+   boot in testing, and switches the wizard off the moment it does
 6. switches the stock launcher off again and puts your launcher back as Home, or leaves the stock
    launcher on if that fails
 7. switches Wireless debugging off again
@@ -61,11 +61,19 @@ as "already fine": the credentials are checked, and the wizard is switched back 
 
 ### If a run is interrupted
 
-A run records what it is about to change *before* it changes anything, and clears that record when it
-finishes. If the TV sleeps, adb stalls past its retries, or Android kills the app mid-run, the next run —
-after a restart, from the button, or just by opening the app — finds the record and puts the device back
-first: the setup wizard off, the stock launcher back as it was, and Home returned to your launcher. Until
-that happens the app's screen says the last run did not finish.
+A run records what it is about to change *before* it changes anything, and clears that record only once the
+wizard is off and Home is back. If the TV sleeps, adb stalls past its retries, or Android kills the app
+mid-run, the next run — after a restart, from the button, or just by opening the app — finds the record and
+puts the device back first: the setup wizard off, the stock launcher back as it was, and Home returned to
+your launcher. Until that happens the app's screen says the last run did not finish.
+
+### If a boot run loses to the network
+
+A run started at boot can find Wi-Fi still coming up. It waits up to two minutes for an address, and if the
+first attempt still fails, one more attempt runs a minute later. That covers the ordinary case where the
+radio associates late, without leaving the TV without credentials until someone opens the app by hand.
+Installing an update also triggers a run, because an update replaces the running process and would otherwise
+leave casting broken until the next restart.
 
 ## Install (once, from a computer with adb)
 
@@ -105,8 +113,10 @@ within a minute.
   because a paired key otherwise lapses after 7 days without a connection and restarts can be further
   apart than that. This applies to every paired key, including your computer's. It is only set when it
   is not already 0, so uninstalling can put the default back.
-- No network use beyond adb over loopback and an mDNS lookup of the TV's own debugging port. No
-  analytics, no internet access.
+- No network use beyond adb over loopback, an mDNS lookup of the TV's own debugging port, and a
+  device-auth handshake against the TV's own port 8009 on loopback when the log cannot say whether the
+  receiver has its credentials. That handshake is read-only, stays on 127.0.0.1, and only checks whether
+  the reply carries a signature. No analytics, no internet access.
 
 ## Uninstall
 
@@ -155,21 +165,25 @@ the wait starts; that hung a run once just after a cold boot.
 
 Two things to know when reading the logs by hand:
 
-- The receiver's state is decided from a **window**, not from a snapshot. The main log buffer on a Google
-  TV Streamer is 256 KiB and the Cast receiver alone fills it in well under an hour, so "no failure line in
-  the buffer" means nothing. Cast Fix watches for two of the receiver's one-minute retries and only calls
-  a silent receiver healthy when it has watched a full window.
-- Timestamps are read as epoch seconds (`logcat -v epoch`), so the check survives midnight, a timezone
-  change, and the clock stepping when NTP syncs after boot. The `MM-DD hh:mm:ss` form is ambiguous across
-  midnight and moves backwards when the clock does.
+- The receiver's state is **not** decided from the log. It is decided by making the device-auth handshake
+  a phone makes, against the TV's own port 8009 on loopback: a signed reply means the credentials are in
+  memory right now. The check is read-only, takes well under a second, and is the only one that describes
+  the device as it is rather than as some earlier moment.
+- The log is still written for diagnosis, with epoch timestamps (`logcat -v epoch`) so it survives
+  midnight, a timezone change and the clock stepping when NTP syncs after boot.
 
-A third, learned the hard way on the Streamer:
+Why the log could not answer the question, learned on the Streamer:
 
 - The line that proves success, `Created singleton instance of ClientAuthSigner`, is logged by the native
-  shell under the tag **`cast_shell`**, not by `cast_ClientAuthCredsFactoryProvisioned`. Filtering by tag
-  misses it entirely and reports "did not load" while the receiver is in fact signing correctly. Cast Fix
-  filters by message text and also treats the retries stopping as success, because a receiver that had
-  already loaded and been restarted does not log the signer again.
+  shell under the tag **`cast_shell`**, not by `cast_ClientAuthCredsFactoryProvisioned`, so filtering by
+  tag misses it entirely.
+- The main buffer is 256 KiB and the receiver fills it in under a day, while it loads its credentials only
+  once. Come back the next evening and the load line has rolled out while the credentials are still in
+  memory - and a receiver that already holds them logs nothing at all.
+- Just after the setup wizard is enabled - the one moment the answer matters - the retry that failed a
+  second earlier is still in the buffer, and both timestamps truncate to the same epoch second. The log
+  cannot tell that failure from a fresh one, which is what made a run at boot give up two seconds after
+  enabling the wizard and report failure while the receiver was still 29 seconds from its next attempt.
 
 ## Build
 

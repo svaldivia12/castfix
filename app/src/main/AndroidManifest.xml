@@ -23,9 +23,12 @@
         android:label="Cast Fix"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
+        <!-- singleTop so an "am start" with the run extra reaches onNewIntent instead of stacking a second
+             copy of the screen, which is how the run-by-adb path documented in the README works. -->
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -42,11 +45,14 @@
                 android:value="Reloads the Cast receiver's device credentials after boot" />
         </service>
 
+        <!-- MY_PACKAGE_REPLACED as well as BOOT_COMPLETED: an app update replaces the running process without
+             a reboot, and casting would otherwise be left broken until the next restart. -->
         <receiver
             android:name=".BootReceiver"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
 

@@ -35,10 +35,21 @@ final class CastFixer {
     private static final String ADB_TIMEOUT = "adb_allowed_connection_time";
     private static final String KEEP_DEBUGGING = "castfix_keep_debugging";
     /**
-     * The receiver retries once a minute while loading fails and logs the signer when it succeeds; 100 s
-     * leaves room for one missed retry.
+     * How long to wait, after enabling the wizard, for the receiver to pick the credentials up.
+     *
+     * <p>The receiver retries at most once a minute, so the retry that can see the provider may be a minute
+     * away; on a cold boot measured on kirkwood it was 31 s. The verdict comes from the handshake rather than
+     * the log, because at exactly this moment the log lies: a retry that failed one second before the wizard
+     * was enabled is still inside the window, and truncating both to whole seconds makes them indistinguishable.
      */
-    private static final long CREDS_WAIT_MS = 100_000;
+    private static final long CREDS_WAIT_MS = 150_000;
+    /** How often the handshake is retried while waiting for the receiver to pick the provider up. */
+    private static final long PROBE_EVERY_MS = 5_000;
+    /**
+     * How long to wait for Wi-Fi before giving up. A run at boot can start before the network is up: measured
+     * on kirkwood the radio associated well after BOOT_COMPLETED was delivered.
+     */
+    private static final long CONNECT_TIMEOUT_MS = 120_000;
 
     private final Context context;
     private final FixLog log;
@@ -55,10 +66,13 @@ final class CastFixer {
         log.add("--- run (" + trigger + ")");
         if (context.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS)
                 != PackageManager.PERMISSION_GRANTED) {
-            return log.result("Needs WRITE_SECURE_SETTINGS, granted once from a computer (README, Setup).");
+            return log.result("Cast Fix is missing the settings permission. Grant it once from a computer; "
+                    + "see Setup in the README.");
         }
-        String ip = waitForWifi(90_000);
-        if (ip == null) return log.result("No Wi-Fi after 90 s; nothing changed.");
+        // A run started at boot can find the network still coming up. Waiting is cheaper than failing and
+        // leaving the TV without credentials until someone opens the app by hand.
+        String ip = waitForWifi(CONNECT_TIMEOUT_MS);
+        if (ip == null) return log.result("This TV has no Wi-Fi, so it cannot be reached. Nothing was changed.");
         ContentResolver resolver = context.getContentResolver();
         boolean debuggingWasOn = Settings.Global.getInt(resolver, ADB_WIFI, 0) == 1;
         Settings.Global.putInt(resolver, ADB_WIFI, 1);
@@ -66,25 +80,39 @@ final class CastFixer {
         // silently converting the owner's (and every other paired key's) expiry to "never".
         boolean timeoutWasSet = setAdbTimeoutOnce(resolver);
         try (Shell shell = new Shell(context, ip, log)) {
-            if (!shell.connect()) return log.result("Could not reach Wireless debugging on this TV.");
+            if (!shell.connect()) return log.result("Could not reach Wireless debugging. Turn it on and fix again.");
             // Recovery before any new work: putting the device back matters more than fixing it again, and a
             // wizard left on by a dead run is the one state that must not survive another run. It also hands
             // Home back, so what is read afterwards is the launcher the owner actually chose.
             recover(shell);
-            journal.begin(trigger, debuggingWasOn, timeoutWasSet, HomeState.read(shell).component);
+            String homeBefore = HomeState.read(shell).component;
+            journal.begin(trigger, debuggingWasOn, timeoutWasSet, homeBefore);
             String result;
+            FixLog.Outcome outcome = FixLog.Outcome.ATTENTION;
+            boolean finished = false;
             try {
-                result = fix(shell);
+                Outcome fixResult = fix(shell, homeBefore);
+                result = fixResult.message;
+                outcome = fixResult.outcome;
+                // Only now is the wizard provably off and Home back, so only now is the record safe to clear.
+                journal.finish();
+                finished = true;
             } finally {
-                // Last-resort guard: whatever happened above, a run that enabled the wizard disables it again.
-                if (journal.setupEnabledByUs()) disableWizard(shell);
+                // Any exit from here - including an exception - must not leave the wizard on. The guard runs
+                // only when the run did not complete, so a finished run does not repeat its own work, and a
+                // failed one keeps the record so the next start recovers.
+                if (!finished) {
+                    if (journal.setupEnabledByUs() || !hasPackage(
+                            shell.run("pm list packages -d --user 0"), SETUP)) {
+                        disableWizard(shell);
+                    }
+                }
             }
-            journal.finish();
-            return log.result(result);
+            return log.result(result, outcome);
         } catch (Exception e) {
             // The journal stays active on purpose: the next start recovers.
             log.add("error: " + e);
-            return log.result("Failed: " + e.getMessage());
+            return log.result("The fix stopped with an error: " + e.getMessage());
         } finally {
             // Troubleshooting: `settings put global castfix_keep_debugging 1` keeps it on to read the logs.
             if (!debuggingWasOn && Settings.Global.getInt(resolver, KEEP_DEBUGGING, 0) != 1) {
@@ -94,40 +122,42 @@ final class CastFixer {
         }
     }
 
-    /** The fix proper; returns the one-line result. Never logs it, so the caller can attach the outcome. */
-    private String fix(Shell shell) throws Exception {
+    /** The fix proper: a one-line result for the screen, plus how the device was left. */
+    private static final class Outcome {
+        final String message;
+        final FixLog.Outcome outcome;
+
+        Outcome(String message, FixLog.Outcome outcome) {
+            this.message = message;
+            this.outcome = outcome;
+        }
+
+        static Outcome working(String message) {
+            return new Outcome(message, FixLog.Outcome.HEALTHY);
+        }
+
+        static Outcome attention(String message) {
+            return new Outcome(message, FixLog.Outcome.ATTENTION);
+        }
+    }
+
+    /** The fix proper. Never logs the result, so the caller can record it once. */
+    private Outcome fix(Shell shell, String homeBefore) throws Exception {
         String disabled = shell.run("pm list packages -d --user 0");
         if (!packageExists(shell, SETUP)) {
-            return "This TV has no setup wizard package, so there is nothing for Cast Fix to do.";
+            return Outcome.attention("This TV has no setup wizard package, so there is nothing to fix.");
         }
         if (!packageExists(shell, CAST_RECEIVER)) {
-            return "This TV has no Cast receiver (mediashell), so it is not a Google TV device.";
+            return Outcome.attention("This TV has no Cast receiver, so it is not a Google TV device.");
         }
         boolean setupOn = !hasPackage(disabled, SETUP);
-        ReceiverState.Verdict verdict = ReceiverState.watch(shell, log, CREDS_WAIT_MS);
+        Outcome fine = alreadyFine(shell, setupOn);
+        if (fine != null) return fine;
 
-        if (verdict.healthy() && setupOn) {
-            // Not "already fine": on kirkwood an enabled wizard is the crash-loop precondition. This is a
-            // repair, and the message must read as one.
-            log.add("receiver healthy (" + verdict + ") but the setup wizard was on; switching it off");
-            disableWizard(shell);
-            journal.finish();
-            return "Setup wizard switched back off. Casting ready.";
-        }
-        if (verdict.healthy()) {
-            log.add("receiver healthy (" + verdict + ")");
-            journal.finish();
-            return "Casting already works.";
-        }
-
-        String homeBefore = journal.homeBefore();
-        long wizardOpenedAt = 0;
         if (setupOn) {
-            // Somebody else left it on: it still has to come off when this run ends. The window starts now,
-            // because whatever failed before this point is not this run's doing.
-            log.add("setup wizard was already on; waiting for the receiver");
+            // Somebody else left it on: it still has to come off when this run ends.
+            log.add("setup wizard was already on and the receiver cannot sign yet; waiting for the receiver");
             journal.setupEnabled();
-            wizardOpenedAt = ReceiverState.deviceNow(shell);
         } else {
             boolean stockHomeWasOff = hasPackage(disabled, STOCK_HOME) && packageExists(shell, STOCK_HOME);
             // Stock launcher first. Measured on kirkwood the resolver ranks launcherx (priority 2) above
@@ -143,45 +173,103 @@ final class CastFixer {
                     log.add("could not enable the stock launcher; carrying on with the wizard alone");
                 }
             }
-            // Timestamped before the enable, so the wait can ignore the retry that failed just before it.
-            long requestedAt = ReceiverState.deviceNow(shell);
             if (!enablePackage(shell, SETUP)) {
                 restoreHome(shell, homeBefore);
-                journal.finish();
-                return "Could not switch the setup wizard on; nothing changed.";
+                return Outcome.attention("Could not switch the setup wizard on. Nothing was changed.");
             }
             log.add("setup wizard on, waiting for the Cast receiver");
             journal.setupEnabled();
-            wizardOpenedAt = requestedAt;
         }
 
-        long loadedAt = awaitSigner(shell, wizardOpenedAt);
+        long outcome = awaitSigner(shell);
         // Close the crash-loop window as early as possible, not after the rest of the run.
-        disableWizard(shell);
+        boolean wizardOff = disableWizard(shell);
         restoreHome(shell, homeBefore);
-        journal.finish();
-        if (loadedAt > 0) {
+        if (outcome == LOADED) {
             log.add("credentials loaded");
-            return "Casting ready (credentials loaded).";
+            // A wizard left on would make this the crash-loop state, whatever the credentials say.
+            return wizardOff
+                    ? Outcome.working("Credentials loaded and the setup wizard is off.")
+                    : Outcome.attention("Credentials loaded, but the setup wizard is still on. Try again.");
         }
-        return "Cast credentials did not load; run it again.";
+        return Outcome.attention("The receiver did not load credentials in time. Try again.");
     }
 
     /**
-     * Waits for the receiver to pick up credentials after the wizard came on, and returns 1 on success, 0 on
-     * failure.
+     * Answers "is there anything to do?" from the handshake, before any waiting.
      *
-     * <p>Ignores anything logged before {@code enabledAt}: the retry that failed just before the wizard was
-     * enabled is still in the buffer and would otherwise be read as "the wizard did not help". Uses the same
-     * window logic as the health check rather than the signer line alone, because a receiver that has loaded
-     * credentials and stopped retrying does not log the signer again (measured on kirkwood: signature 256 on
-     * the 8009 handshake while no singleton line existed in any buffer).
+     * <p>A signed reply is proof the receiver holds credentials, so a wizard left on can simply be switched
+     * off and a healthy device is recognised in seconds instead of the two minutes a log window costs. This
+     * is the same question the old code asked with {@code ReceiverState.watch}, whose window existed only
+     * because the log cannot be trusted - the handshake makes that whole wait unnecessary on the happy path.
+     *
+     * @param setupOn whether the wizard is currently enabled
+     * @return the result to report, or null when the device does need the wizard
      */
-    private long awaitSigner(Shell shell, long enabledAt) throws Exception {
-        ReceiverState.Verdict verdict = ReceiverState.watch(shell, log, CREDS_WAIT_MS, enabledAt);
-        log.add("receiver after enabling the wizard: " + verdict);
-        return verdict.healthy() ? 1 : 0;
+    private Outcome alreadyFine(Shell shell, boolean setupOn) throws Exception {
+        ReceiverState.Probe probe = ReceiverState.probe(shell, log);
+        if (probe != ReceiverState.Probe.SIGNED) {
+            // Unsigned means the credentials are genuinely missing. Unreachable means the receiver is not
+            // serving at all, which the wizard cannot fix either: say so rather than reopening it.
+            if (probe == ReceiverState.Probe.UNREACHABLE) {
+                log.add("device-auth port not answering and the wizard is "
+                        + (setupOn ? "on" : "off"));
+            }
+            return null;
+        }
+        if (setupOn) {
+            // Not "already fine": on kirkwood an enabled wizard is the crash-loop precondition. This is a
+            // repair, and the message must read as one.
+            log.add("receiver signs, but the setup wizard was on; switching it off");
+            boolean wizardOff = disableWizard(shell);
+            return wizardOff
+                    ? Outcome.working("The setup wizard was on and is now off. Credentials were already loaded.")
+                    : Outcome.attention("The setup wizard is still on. Try again, or turn Developer options on.");
+        }
+        log.add("receiver already signs; nothing to do");
+        return Outcome.working("Credentials were already loaded.");
     }
+
+    /** Waits for the receiver to pick credentials up after the wizard came on, and reports whether it did.
+     *
+     * <p>The verdict comes from the device-auth handshake, not from the log. The log cannot be trusted here:
+     * on a cold boot the retry that failed one second before the wizard was enabled is still inside the
+     * window, and because both timestamps are truncated to whole seconds it is indistinguishable from a
+     * fresh failure. That is exactly what made a boot run give up 2 s after enabling the wizard and report
+     * "did not load" while the receiver was still 29 s from its next attempt.
+     *
+     * <p>The handshake also answers the other question the log never could: a receiver that already holds its
+     * credentials signs immediately, without logging anything at all.
+     *
+     * @return {@link #LOADED} once a signed reply comes back, or {@link #FAILED} if none does in time
+     */
+    private long awaitSigner(Shell shell) throws Exception {
+        long deadline = SystemClock.elapsedRealtime() + CREDS_WAIT_MS;
+        int attempts = 0;
+        while (SystemClock.elapsedRealtime() < deadline) {
+            ReceiverState.Probe probe = ReceiverState.probe(shell, log);
+            attempts++;
+            if (probe == ReceiverState.Probe.SIGNED) {
+                log.add("receiver signed on attempt " + attempts + " after enabling the wizard");
+                return LOADED;
+            }
+            if (probe == ReceiverState.Probe.UNREACHABLE) {
+                // The port being closed is not the same as "no credentials"; keep trying, the receiver may
+                // still be starting on a device that just booted.
+                log.add("device-auth port not answering yet (attempt " + attempts + ")");
+            }
+            // Also record what the log says, for diagnosis only: it must not decide the outcome.
+            log.add("attempt " + attempts + ": " + ReceiverState.describe(shell));
+            Thread.sleep(PROBE_EVERY_MS);
+        }
+        log.add("receiver still not signing after " + (CREDS_WAIT_MS / 1000) + " s");
+        return FAILED;
+    }
+
+    /** Credentials confirmed in memory. */
+    private static final long LOADED = 1;
+    /** The receiver never signed within the wait. */
+    private static final long FAILED = 0;
 
     /**
      * Puts the device back after a run that did not finish. Order is not negotiable: the wizard goes off
@@ -190,10 +278,9 @@ final class CastFixer {
     private void recover(Shell shell) throws Exception {
         if (!journal.isActive()) return;
         log.add("previous run (" + journal.trigger() + ") did not finish; putting things back first");
-        if (journal.setupEnabledByUs()
-                || !hasPackage(shell.run("pm list packages -d --user 0"), SETUP)) {
-            disableWizard(shell);
-        }
+        // Unconditional, and the first thing done: a wizard left on by any means is the crash-loop state,
+        // whatever the journal managed to write before the process died.
+        disableWizard(shell);
         if (journal.stockHomeWasOff() && packageExists(shell, STOCK_HOME)) {
             if (!enablePackage(shell, STOCK_HOME)) log.add("could not re-enable the stock launcher");
         }
@@ -232,16 +319,15 @@ final class CastFixer {
     /** Disables the wizard and confirms it; a silent failure here is what the crash loop grows out of. */
     private boolean disableWizard(Shell shell) throws Exception {
         Shell.Result result = shell.runChecked("pm disable-user --user 0 " + SETUP);
-        if (!result.ok()) {
-            log.add("could not disable the setup wizard: " + result.problem());
-            return false;
+        // Confirmed from the package manager, not from the exit status: adb can return before the command's
+        // status does, and what matters is the state the device ended up in.
+        if (hasPackage(shell.run("pm list packages -d --user 0"), SETUP)) {
+            log.add("setup wizard off");
+            return true;
         }
-        if (!hasPackage(shell.run("pm list packages -d --user 0"), SETUP)) {
-            log.add("setup wizard still enabled after disable-user");
-            return false;
-        }
-        log.add("setup wizard off");
-        return true;
+        log.add("could not disable the setup wizard"
+                + (result.ok() ? "" : ": " + result.problem()));
+        return false;
     }
 
     private boolean enablePackage(Shell shell, String pkg) throws Exception {
@@ -250,11 +336,11 @@ final class CastFixer {
             return false;
         }
         Shell.Result result = shell.runChecked("pm enable --user 0 " + pkg);
-        if (!result.ok()) {
-            log.add("pm enable " + pkg + " failed: " + result.problem());
-            return false;
-        }
-        return true;
+        // Same reasoning as disableWizard: the state is the evidence, the exit status is a hint.
+        if (!hasPackage(shell.run("pm list packages -d --user 0"), pkg)) return true;
+        log.add("pm enable " + pkg + " did not take effect"
+                + (result.ok() ? "" : ": " + result.problem()));
+        return false;
     }
 
     /**
@@ -334,6 +420,7 @@ final class CastFixer {
     /** A one-line description of the unfinished run, for the status screen. */
     String recoveryNote() {
         if (!journal.isActive()) return "";
-        return "Last run (" + journal.trigger() + ") did not finish; the next run puts things back first.";
+        // Headline form: the screen shows this instead of the normal status, so it has to read as a state.
+        return "A fix was interrupted. The setup wizard may still be on until the next fix runs.";
     }
 }
